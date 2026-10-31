@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -13,7 +14,7 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("System Status HUD")]
 [assembly: System.Reflection.AssemblyDescription("Windows hardware status overlay")]
 [assembly: System.Reflection.AssemblyProduct("System Status HUD")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.0.0.0")]
 
 namespace SystemStatusHUD
 {
@@ -44,6 +45,10 @@ namespace SystemStatusHUD
         private readonly MetricView _disk = new MetricView("硬盘", "磁盘活动", Color.FromArgb(214, 117, 35));
         private const string StartupRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string StartupValueName = "SystemStatusHUD";
+        private const int WsExLayered = 0x00080000;
+        private const int BackgroundRefreshInterval = 33;
+        private const int BackgroundPadding = 12;
+        private const float WindowCornerRadius = 20f;
         private readonly Font _nameFont = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold, GraphicsUnit.Point);
         private readonly Font _captionFont = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular, GraphicsUnit.Point);
         private readonly Font _valueFont = new Font("Consolas", 12.5f, FontStyle.Bold, GraphicsUnit.Point);
@@ -53,11 +58,21 @@ namespace SystemStatusHUD
         private readonly ToolStripMenuItem _startupMenuItem;
         private Icon _applicationIcon;
         private System.Threading.Timer _collectorTimer;
+        private System.Windows.Forms.Timer _backgroundTimer;
         private MetricCollector _collector;
         private int _updateInProgress;
-        private Bitmap _desktopSnapshot;
+        private bool _refreshingBackground;
+        private bool _dragging;
+        private bool _displayAffinityHeld;
+        private Point _dragOffset;
+        private Bitmap _captureSurface;
+        private Bitmap _blurSurface;
         private Bitmap _frostedBackground;
-        private Rectangle _desktopBounds;
+        private Bitmap _glassOverlay;
+        private Bitmap _metricOverlay;
+        private Bitmap _frameBitmap;
+        private byte[] _framePixels;
+        private byte[] _cornerMask;
 
         public StatusForm()
         {
@@ -107,72 +122,299 @@ namespace SystemStatusHUD
             _trayIcon.Visible = true;
         }
 
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams parameters = base.CreateParams;
+                parameters.ExStyle |= WsExLayered;
+                return parameters;
+            }
+        }
+
         protected override void OnLoad(EventArgs e)
         {
             Rectangle area = Screen.PrimaryScreen.WorkingArea;
             Location = new Point(area.Right - Width - 14, area.Top + 14);
-            CaptureDesktopSnapshot();
-            RefreshFrostedBackground();
+            InitializeRenderingSurfaces();
             base.OnLoad(e);
         }
 
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            ApplyRoundedRegion();
+            _displayAffinityHeld = NativeMethods.SetWindowDisplayAffinity(Handle, 0x11);
+            if (_displayAffinityHeld)
+                NativeMethods.DwmFlush();
+            RefreshFrostedBackground();
+            RenderLayeredWindow();
+            ReleaseDisplayAffinity();
+            _backgroundTimer = new System.Windows.Forms.Timer();
+            _backgroundTimer.Interval = BackgroundRefreshInterval;
+            _backgroundTimer.Tick += delegate
+            {
+                if (_dragging)
+                    RefreshRealtimeFrame();
+            };
+            _backgroundTimer.Start();
             _collectorTimer = new System.Threading.Timer(UpdateMetrics, null, 0, 1000);
         }
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
-            Graphics g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.CompositingQuality = CompositingQuality.HighQuality;
-
-            if (_frostedBackground != null)
-                g.DrawImageUnscaled(_frostedBackground, 0, 0);
-            else
-            {
-                using (Brush fallback = new SolidBrush(Color.FromArgb(224, 238, 247)))
-                    g.FillRectangle(fallback, ClientRectangle);
-            }
-
-            using (LinearGradientBrush veil = new LinearGradientBrush(
-                ClientRectangle, Color.FromArgb(174, 250, 254, 255), Color.FromArgb(142, 207, 234, 247), LinearGradientMode.Vertical))
-                g.FillRectangle(veil, ClientRectangle);
-            using (Brush coolGlow = new SolidBrush(Color.FromArgb(24, 84, 174, 255)))
-                g.FillEllipse(coolGlow, -74, -88, 258, 186);
-            using (Brush softGlow = new SolidBrush(Color.FromArgb(22, 255, 255, 255)))
-                g.FillEllipse(softGlow, 196, 176, 224, 214);
+            // UpdateLayeredWindow presents the cached surface instead of WM_PAINT.
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            base.OnPaint(e);
-            Graphics g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.CompositingQuality = CompositingQuality.HighQuality;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-
-            using (Pen border = new Pen(Color.FromArgb(210, 255, 255, 255), 1f))
-                DrawRoundedRectangle(g, border, new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), 16f);
-            using (Pen innerBorder = new Pen(Color.FromArgb(48, 70, 116, 145), 1f))
-                DrawRoundedRectangle(g, innerBorder, new RectangleF(1.5f, 1.5f, Width - 3f, Height - 3f), 15f);
-
-            DrawMetric(g, _cpu, new Rectangle(12, 12, 332, 56));
-            DrawMetric(g, _gpu, new Rectangle(12, 74, 332, 56));
-            DrawMetric(g, _memory, new Rectangle(12, 136, 332, 56));
-            DrawMetric(g, _disk, new Rectangle(12, 198, 332, 56));
         }
 
-        private void DrawMetric(Graphics g, MetricView metric, Rectangle bounds)
+        private static void ConfigureLiquidGraphics(Graphics g)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.CompositingMode = CompositingMode.SourceOver;
+            g.CompositingQuality = CompositingQuality.GammaCorrected;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        }
+
+        private void DrawLiquidBackground(Graphics g)
+        {
+            ConfigureLiquidGraphics(g);
+            RectangleF shell = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
+            GraphicsState state = g.Save();
+            using (GraphicsPath clip = CreateRoundedPath(shell, WindowCornerRadius))
+                g.SetClip(clip);
+
+            using (LinearGradientBrush veil = new LinearGradientBrush(
+                ClientRectangle, Color.FromArgb(54, 248, 252, 254), Color.FromArgb(30, 185, 198, 207), LinearGradientMode.Vertical))
+                g.FillRectangle(veil, ClientRectangle);
+
+            using (LinearGradientBrush crown = new LinearGradientBrush(
+                new RectangleF(0, 0, Width, 74), Color.FromArgb(70, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), LinearGradientMode.Vertical))
+                g.FillRectangle(crown, 0, 0, Width, 74);
+
+            using (LinearGradientBrush leftRefraction = new LinearGradientBrush(
+                new RectangleF(0, 0, 46, Height), Color.FromArgb(38, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), LinearGradientMode.Horizontal))
+                g.FillRectangle(leftRefraction, 0, 0, 46, Height);
+
+            using (LinearGradientBrush lowerShade = new LinearGradientBrush(
+                new RectangleF(0, Height - 72, Width, 72), Color.FromArgb(0, 38, 59, 72), Color.FromArgb(34, 28, 47, 60), LinearGradientMode.Vertical))
+                g.FillRectangle(lowerShade, 0, Height - 72, Width, 72);
+
+            using (Brush coolGlow = new SolidBrush(Color.FromArgb(9, 91, 183, 255)))
+                g.FillEllipse(coolGlow, -62, -78, 242, 168);
+            using (Brush spectralGlow = new SolidBrush(Color.FromArgb(7, 185, 126, 255)))
+                g.FillEllipse(spectralGlow, Width - 130, -58, 186, 142);
+            g.Restore(state);
+        }
+
+        private void DrawLiquidContent(Graphics g)
+        {
+            ConfigureLiquidGraphics(g);
+            RectangleF outer = new RectangleF(0.75f, 0.75f, Width - 1.5f, Height - 1.5f);
+            using (LinearGradientBrush rimBrush = new LinearGradientBrush(
+                outer, Color.FromArgb(242, 255, 255, 255), Color.FromArgb(92, 66, 88, 103), 112f))
+            {
+                ColorBlend rimBlend = new ColorBlend();
+                rimBlend.Colors = new Color[]
+                {
+                    Color.FromArgb(242, 255, 255, 255),
+                    Color.FromArgb(176, 222, 244, 255),
+                    Color.FromArgb(118, 216, 204, 255),
+                    Color.FromArgb(78, 58, 78, 91)
+                };
+                rimBlend.Positions = new float[] { 0f, 0.32f, 0.68f, 1f };
+                rimBrush.InterpolationColors = rimBlend;
+                using (Pen rim = new Pen(rimBrush, 1.35f))
+                    DrawRoundedRectangle(g, rim, outer, WindowCornerRadius);
+            }
+
+            RectangleF inner = new RectangleF(2.1f, 2.1f, Width - 4.2f, Height - 4.2f);
+            using (LinearGradientBrush innerRimBrush = new LinearGradientBrush(
+                inner, Color.FromArgb(98, 255, 255, 255), Color.FromArgb(54, 25, 45, 58), LinearGradientMode.Vertical))
+            using (Pen innerRim = new Pen(innerRimBrush, 0.9f))
+                DrawRoundedRectangle(g, innerRim, inner, WindowCornerRadius - 1.4f);
+
+            DrawMetricGlass(g, _cpu, new Rectangle(12, 12, 332, 56));
+            DrawMetricGlass(g, _gpu, new Rectangle(12, 74, 332, 56));
+            DrawMetricGlass(g, _memory, new Rectangle(12, 136, 332, 56));
+            DrawMetricGlass(g, _disk, new Rectangle(12, 198, 332, 56));
+        }
+
+        private void InitializeRenderingSurfaces()
+        {
+            _captureSurface = new Bitmap(Width + BackgroundPadding * 2, Height + BackgroundPadding * 2, PixelFormat.Format32bppRgb);
+            _blurSurface = new Bitmap(Math.Max(1, _captureSurface.Width / 5), Math.Max(1, _captureSurface.Height / 5), PixelFormat.Format32bppRgb);
+            _frostedBackground = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb);
+            using (Graphics g = Graphics.FromImage(_frostedBackground))
+                g.Clear(Color.FromArgb(215, 226, 233));
+            _frameBitmap = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb);
+            _framePixels = new byte[Width * Height * 4];
+            _cornerMask = new byte[Width * Height];
+            _glassOverlay = CreateLiquidLayer(delegate(Graphics g)
+            {
+                DrawLiquidBackground(g);
+                DrawLiquidContent(g);
+            });
+            RefreshMetricOverlay();
+
+            using (Bitmap mask = CreateLiquidLayer(delegate(Graphics g)
+            {
+                using (Brush fill = new SolidBrush(Color.White))
+                    FillRoundedRectangle(g, fill, new RectangleF(0, 0, Width, Height), WindowCornerRadius);
+            }))
+            {
+                BitmapData data = mask.LockBits(ClientRectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+                try
+                {
+                    Marshal.Copy(data.Scan0, _framePixels, 0, _framePixels.Length);
+                    for (int pixel = 0; pixel < _cornerMask.Length; pixel++)
+                        _cornerMask[pixel] = _framePixels[pixel * 4 + 3];
+                }
+                finally
+                {
+                    mask.UnlockBits(data);
+                }
+            }
+        }
+
+        private Bitmap CreateLiquidLayer(Action<Graphics> draw)
+        {
+            const int renderScale = 3;
+            using (Bitmap highResolution = new Bitmap(Width * renderScale, Height * renderScale, PixelFormat.Format32bppPArgb))
+            {
+                using (Graphics g = Graphics.FromImage(highResolution))
+                {
+                    g.Clear(Color.Transparent);
+                    ConfigureLiquidGraphics(g);
+                    g.ScaleTransform(renderScale, renderScale);
+                    draw(g);
+                }
+
+                Bitmap layer = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb);
+                using (Graphics g = Graphics.FromImage(layer))
+                {
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    g.CompositingQuality = CompositingQuality.GammaCorrected;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.DrawImage(highResolution, ClientRectangle,
+                        0, 0, highResolution.Width, highResolution.Height, GraphicsUnit.Pixel);
+                }
+                return layer;
+            }
+        }
+
+        private void RefreshMetricOverlay()
+        {
+            Bitmap layer = CreateLiquidLayer(delegate(Graphics g)
+            {
+                DrawMetricValues(g, _cpu, new Rectangle(12, 12, 332, 56));
+                DrawMetricValues(g, _gpu, new Rectangle(12, 74, 332, 56));
+                DrawMetricValues(g, _memory, new Rectangle(12, 136, 332, 56));
+                DrawMetricValues(g, _disk, new Rectangle(12, 198, 332, 56));
+            });
+            if (_metricOverlay != null)
+                _metricOverlay.Dispose();
+            _metricOverlay = layer;
+        }
+
+        private void RefreshRealtimeFrame()
+        {
+            if (_refreshingBackground || _frameBitmap == null || IsDisposed || !IsHandleCreated || !Visible)
+                return;
+
+            _refreshingBackground = true;
+            try
+            {
+                RefreshFrostedBackground();
+                RenderLayeredWindow();
+            }
+            finally
+            {
+                _refreshingBackground = false;
+            }
+        }
+
+        private void RenderLayeredWindow()
+        {
+            if (!IsHandleCreated || IsDisposed || _frameBitmap == null)
+                return;
+
+            using (Graphics g = Graphics.FromImage(_frameBitmap))
+            {
+                g.CompositingQuality = CompositingQuality.HighSpeed;
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.DrawImageUnscaled(_frostedBackground, 0, 0);
+                g.CompositingMode = CompositingMode.SourceOver;
+                g.DrawImageUnscaled(_glassOverlay, 0, 0);
+                g.DrawImageUnscaled(_metricOverlay, 0, 0);
+            }
+
+            BitmapData data = _frameBitmap.LockBits(ClientRectangle, ImageLockMode.ReadWrite, PixelFormat.Format32bppPArgb);
+            try
+            {
+                Marshal.Copy(data.Scan0, _framePixels, 0, _framePixels.Length);
+                for (int pixel = 0; pixel < _cornerMask.Length; pixel++)
+                {
+                    int alpha = _cornerMask[pixel];
+                    if (alpha == 255)
+                        continue;
+                    int offset = pixel * 4;
+                    for (int channel = 0; channel < 4; channel++)
+                        _framePixels[offset + channel] = (byte)((_framePixels[offset + channel] * alpha + 127) / 255);
+                }
+                Marshal.Copy(_framePixels, 0, data.Scan0, _framePixels.Length);
+            }
+            finally
+            {
+                _frameBitmap.UnlockBits(data);
+            }
+            UpdateLayeredBitmap(_frameBitmap);
+        }
+
+        private void UpdateLayeredBitmap(Bitmap bitmap)
+        {
+            IntPtr screenDc = NativeMethods.GetDC(IntPtr.Zero);
+            IntPtr memoryDc = NativeMethods.CreateCompatibleDC(screenDc);
+            IntPtr bitmapHandle = IntPtr.Zero;
+            IntPtr oldBitmap = IntPtr.Zero;
+            try
+            {
+                bitmapHandle = bitmap.GetHbitmap(Color.FromArgb(0));
+                oldBitmap = NativeMethods.SelectObject(memoryDc, bitmapHandle);
+                NativeMethods.NativePoint source = new NativeMethods.NativePoint(0, 0);
+                NativeMethods.NativePoint destination = new NativeMethods.NativePoint(Left, Top);
+                NativeMethods.NativeSize size = new NativeMethods.NativeSize(Width, Height);
+                NativeMethods.BlendFunction blend = new NativeMethods.BlendFunction();
+                blend.BlendOp = 0;
+                blend.SourceConstantAlpha = 255;
+                blend.AlphaFormat = 1;
+                NativeMethods.UpdateLayeredWindow(
+                    Handle, screenDc, ref destination, ref size, memoryDc,
+                    ref source, 0, ref blend, 2);
+            }
+            finally
+            {
+                if (oldBitmap != IntPtr.Zero)
+                    NativeMethods.SelectObject(memoryDc, oldBitmap);
+                if (bitmapHandle != IntPtr.Zero)
+                    NativeMethods.DeleteObject(bitmapHandle);
+                NativeMethods.DeleteDC(memoryDc);
+                NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
+            }
+        }
+
+        private void DrawMetricGlass(Graphics g, MetricView metric, Rectangle bounds)
         {
             RectangleF shadowBounds = new RectangleF(bounds.Left + 1, bounds.Top + 3, bounds.Width - 2, bounds.Height - 1);
-            using (Brush shadow = new SolidBrush(Color.FromArgb(25, 38, 73, 96)))
+            using (Brush shadow = new SolidBrush(Color.FromArgb(14, 28, 43, 52)))
                 FillRoundedRectangle(g, shadow, shadowBounds, 11f);
 
             using (LinearGradientBrush glass = new LinearGradientBrush(
-                bounds, Color.FromArgb(202, 255, 255, 255), Color.FromArgb(108, 220, 239, 249), LinearGradientMode.Vertical))
+                bounds, Color.FromArgb(62, 255, 255, 255), Color.FromArgb(24, 205, 215, 222), LinearGradientMode.Vertical))
                 FillRoundedRectangle(g, glass, bounds, 11f);
 
             GraphicsState state = g.Save();
@@ -181,16 +423,16 @@ namespace SystemStatusHUD
                 g.SetClip(clip);
                 RectangleF sheenBounds = new RectangleF(bounds.Left, bounds.Top, bounds.Width, 27);
                 using (LinearGradientBrush sheen = new LinearGradientBrush(
-                    sheenBounds, Color.FromArgb(124, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), LinearGradientMode.Vertical))
+                    sheenBounds, Color.FromArgb(38, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), LinearGradientMode.Vertical))
                     g.FillRectangle(sheen, sheenBounds);
-                using (Brush lowerGlow = new SolidBrush(Color.FromArgb(25, metric.Accent)))
+                using (Brush lowerGlow = new SolidBrush(Color.FromArgb(10, metric.Accent)))
                     g.FillEllipse(lowerGlow, bounds.Right - 104, bounds.Bottom - 36, 132, 62);
             }
             g.Restore(state);
 
-            using (Pen border = new Pen(Color.FromArgb(210, 255, 255, 255), 1f))
+            using (Pen border = new Pen(Color.FromArgb(118, 255, 255, 255), 1f))
                 DrawRoundedRectangle(g, border, bounds, 11f);
-            using (Pen innerBorder = new Pen(Color.FromArgb(40, 57, 101, 130), 1f))
+            using (Pen innerBorder = new Pen(Color.FromArgb(30, 48, 62, 70), 1f))
                 DrawRoundedRectangle(g, innerBorder,
                     new RectangleF(bounds.Left + 1, bounds.Top + 1, bounds.Width - 2, bounds.Height - 2), 10f);
 
@@ -198,7 +440,10 @@ namespace SystemStatusHUD
             using (LinearGradientBrush accentBrush = new LinearGradientBrush(
                 accentPill, Color.FromArgb(235, metric.Accent), Color.FromArgb(112, metric.Accent), LinearGradientMode.Vertical))
                 FillRoundedRectangle(g, accentBrush, accentPill, 1.5f);
+        }
 
+        private void DrawMetricValues(Graphics g, MetricView metric, Rectangle bounds)
+        {
             using (Brush accent = new SolidBrush(metric.Accent))
                 g.DrawString(metric.Name, _nameFont, accent, bounds.Left + 18, bounds.Top + 6);
             float nameWidth = g.MeasureString(metric.Name, _nameFont).Width;
@@ -263,6 +508,8 @@ namespace SystemStatusHUD
 
         private void ApplySnapshot(HardwareSnapshot snapshot)
         {
+            if (IsDisposed || Disposing)
+                return;
             _cpu.Percent = snapshot.CpuLoad;
             _cpu.Detail = "功耗  " + FormatPower(snapshot.CpuPowerWatts);
             _gpu.Percent = snapshot.GpuLoad;
@@ -271,7 +518,8 @@ namespace SystemStatusHUD
             _memory.Detail = FormatBytes(snapshot.MemoryUsedBytes) + " / " + FormatBytes(snapshot.MemoryTotalBytes);
             _disk.Percent = snapshot.DiskActive;
             _disk.Detail = "读 " + FormatRate(snapshot.DiskReadBytesPerSecond) + "   写 " + FormatRate(snapshot.DiskWriteBytesPerSecond);
-            Invalidate();
+            RefreshMetricOverlay();
+            RenderLayeredWindow();
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -279,14 +527,69 @@ namespace SystemStatusHUD
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left)
                 return;
-            NativeMethods.ReleaseCapture();
-            NativeMethods.SendMessage(Handle, 0x00A1, new IntPtr(2), IntPtr.Zero);
-            RefreshFrostedBackground();
-            Invalidate();
+            _dragOffset = e.Location;
+            _displayAffinityHeld = NativeMethods.SetWindowDisplayAffinity(Handle, 0x11);
+            if (_displayAffinityHeld)
+                NativeMethods.DwmFlush();
+            _dragging = true;
+            Capture = true;
+            RefreshRealtimeFrame();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!_dragging)
+                return;
+            Point pointer = Cursor.Position;
+            Location = new Point(pointer.X - _dragOffset.X, pointer.Y - _dragOffset.Y);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (e.Button != MouseButtons.Left || !_dragging)
+                return;
+            _dragging = false;
+            RefreshRealtimeFrame();
+            Capture = false;
+            ReleaseDisplayAffinity();
+        }
+
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            base.OnMouseCaptureChanged(e);
+            if (!Capture && _dragging)
+            {
+                _dragging = false;
+                RefreshRealtimeFrame();
+                ReleaseDisplayAffinity();
+            }
+        }
+
+        private void ReleaseDisplayAffinity()
+        {
+            if (!_displayAffinityHeld)
+                return;
+            NativeMethods.SetWindowDisplayAffinity(Handle, 0);
+            _displayAffinityHeld = false;
+        }
+
+        protected override void OnLocationChanged(EventArgs e)
+        {
+            base.OnLocationChanged(e);
+            if (_dragging)
+                RefreshRealtimeFrame();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            ReleaseDisplayAffinity();
+            if (_backgroundTimer != null)
+            {
+                _backgroundTimer.Stop();
+                _backgroundTimer.Dispose();
+            }
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
             _trayMenu.Dispose();
@@ -294,10 +597,18 @@ namespace SystemStatusHUD
                 _collectorTimer.Dispose();
             if (_collector != null)
                 _collector.Dispose();
+            if (_captureSurface != null)
+                _captureSurface.Dispose();
+            if (_blurSurface != null)
+                _blurSurface.Dispose();
             if (_frostedBackground != null)
                 _frostedBackground.Dispose();
-            if (_desktopSnapshot != null)
-                _desktopSnapshot.Dispose();
+            if (_glassOverlay != null)
+                _glassOverlay.Dispose();
+            if (_metricOverlay != null)
+                _metricOverlay.Dispose();
+            if (_frameBitmap != null)
+                _frameBitmap.Dispose();
             DisposeFonts();
             if (_applicationIcon != null)
                 _applicationIcon.Dispose();
@@ -310,12 +621,6 @@ namespace SystemStatusHUD
             _captionFont.Dispose();
             _valueFont.Dispose();
             _detailFont.Dispose();
-        }
-
-        private void ApplyRoundedRegion()
-        {
-            using (GraphicsPath path = CreateRoundedPath(new RectangleF(0, 0, Width, Height), 16f))
-                Region = new Region(path);
         }
 
         private static string StartupCommand
@@ -363,82 +668,54 @@ namespace SystemStatusHUD
             }
         }
 
-        private void CaptureDesktopSnapshot()
-        {
-            _desktopBounds = SystemInformation.VirtualScreen;
-            try
-            {
-                Bitmap snapshot = new Bitmap(_desktopBounds.Width, _desktopBounds.Height);
-                using (Graphics g = Graphics.FromImage(snapshot))
-                    g.CopyFromScreen(_desktopBounds.Location, Point.Empty, _desktopBounds.Size, CopyPixelOperation.SourceCopy);
-                if (_desktopSnapshot != null)
-                    _desktopSnapshot.Dispose();
-                _desktopSnapshot = snapshot;
-            }
-            catch
-            {
-                if (_desktopSnapshot != null)
-                {
-                    _desktopSnapshot.Dispose();
-                    _desktopSnapshot = null;
-                }
-            }
-        }
-
         private void RefreshFrostedBackground()
         {
-            if (_desktopSnapshot == null)
+            Rectangle captureBounds = new Rectangle(Left - BackgroundPadding, Top - BackgroundPadding, _captureSurface.Width, _captureSurface.Height);
+            Rectangle visible = Rectangle.Intersect(captureBounds, SystemInformation.VirtualScreen);
+
+            // The initial frame is captured while hidden; visible frames are captured only
+            // while drag-time exclusion remains stable, so the HUD cannot sample itself.
+            if (Visible && !_displayAffinityHeld)
                 return;
-
-            Bitmap source = new Bitmap(Width, Height);
-            using (Graphics g = Graphics.FromImage(source))
+            try
             {
-                g.Clear(Color.FromArgb(215, 232, 243));
-                Rectangle windowBounds = new Rectangle(Location, Size);
-                Rectangle visible = Rectangle.Intersect(windowBounds, _desktopBounds);
-                if (!visible.IsEmpty)
+                using (Graphics g = Graphics.FromImage(_captureSurface))
                 {
-                    Rectangle sourceBounds = new Rectangle(
-                        visible.Left - _desktopBounds.Left,
-                        visible.Top - _desktopBounds.Top,
-                        visible.Width,
-                        visible.Height);
-                    Rectangle destinationBounds = new Rectangle(
-                        visible.Left - windowBounds.Left,
-                        visible.Top - windowBounds.Top,
-                        visible.Width,
-                        visible.Height);
-                    g.DrawImage(_desktopSnapshot, destinationBounds, sourceBounds, GraphicsUnit.Pixel);
+                    g.Clear(Color.FromArgb(215, 226, 233));
+                    if (!visible.IsEmpty)
+                        g.CopyFromScreen(visible.Location,
+                            new Point(visible.Left - captureBounds.Left, visible.Top - captureBounds.Top),
+                            visible.Size, CopyPixelOperation.SourceCopy);
                 }
             }
-
-            const int blurScale = 12;
-            int smallWidth = Math.Max(1, Width / blurScale);
-            int smallHeight = Math.Max(1, Height / blurScale);
-            using (Bitmap small = new Bitmap(smallWidth, smallHeight))
+            catch (System.ComponentModel.Win32Exception)
             {
-                using (Graphics g = Graphics.FromImage(small))
-                {
-                    g.CompositingQuality = CompositingQuality.HighQuality;
-                    g.InterpolationMode = InterpolationMode.HighQualityBilinear;
-                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                    g.DrawImage(source, new Rectangle(0, 0, smallWidth, smallHeight));
-                }
-
-                Bitmap blurred = new Bitmap(Width, Height);
-                using (Graphics g = Graphics.FromImage(blurred))
-                {
-                    g.CompositingQuality = CompositingQuality.HighQuality;
-                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                    g.DrawImage(small, ClientRectangle);
-                }
-
-                if (_frostedBackground != null)
-                    _frostedBackground.Dispose();
-                _frostedBackground = blurred;
+                return;
             }
-            source.Dispose();
+
+            using (Graphics g = Graphics.FromImage(_blurSurface))
+            {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.CompositingQuality = CompositingQuality.HighQuality;
+                g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.DrawImage(_captureSurface, new Rectangle(0, 0, _blurSurface.Width, _blurSurface.Height),
+                    0, 0, _captureSurface.Width, _captureSurface.Height, GraphicsUnit.Pixel);
+            }
+
+            using (Graphics g = Graphics.FromImage(_frostedBackground))
+            {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.CompositingQuality = CompositingQuality.HighQuality;
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                RectangleF sourceBounds = new RectangleF(
+                    (float)BackgroundPadding * _blurSurface.Width / _captureSurface.Width,
+                    (float)BackgroundPadding * _blurSurface.Height / _captureSurface.Height,
+                    (float)Width * _blurSurface.Width / _captureSurface.Width,
+                    (float)Height * _blurSurface.Height / _captureSurface.Height);
+                g.DrawImage(_blurSurface, ClientRectangle, sourceBounds, GraphicsUnit.Pixel);
+            }
         }
 
         private static GraphicsPath CreateRoundedPath(RectangleF bounds, float radius)
@@ -1058,12 +1335,74 @@ namespace SystemStatusHUD
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool SetProcessDPIAware();
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool ReleaseCapture();
+        public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmFlush();
 
         [DllImport("user32.dll")]
-        public static extern IntPtr SendMessage(IntPtr hWnd, int message, IntPtr wParam, IntPtr lParam);
+        public static extern IntPtr GetDC(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDc);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool UpdateLayeredWindow(
+            IntPtr hWnd, IntPtr destinationDc, ref NativePoint destination,
+            ref NativeSize size, IntPtr sourceDc, ref NativePoint source,
+            int colorKey, ref BlendFunction blend, int flags);
+
+        [DllImport("gdi32.dll")]
+        public static extern IntPtr CreateCompatibleDC(IntPtr hDc);
+
+        [DllImport("gdi32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DeleteDC(IntPtr hDc);
+
+        [DllImport("gdi32.dll")]
+        public static extern IntPtr SelectObject(IntPtr hDc, IntPtr handle);
+
+        [DllImport("gdi32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DeleteObject(IntPtr handle);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct NativePoint
+        {
+            public int X;
+            public int Y;
+
+            public NativePoint(int x, int y)
+            {
+                X = x;
+                Y = y;
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct NativeSize
+        {
+            public int Width;
+            public int Height;
+
+            public NativeSize(int width, int height)
+            {
+                Width = width;
+                Height = height;
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct BlendFunction
+        {
+            public byte BlendOp;
+            public byte BlendFlags;
+            public byte SourceConstantAlpha;
+            public byte AlphaFormat;
+        }
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
